@@ -1,0 +1,799 @@
+#!/usr/bin/env node
+'use strict';
+
+const fs = require('node:fs');
+const os = require('node:os');
+const path = require('node:path');
+const crypto = require('node:crypto');
+const {spawnSync} = require('node:child_process');
+
+const MAX_HTML_BYTES = 32 * 1024 * 1024;
+const MAX_ASSET_BYTES = 512 * 1024 * 1024;
+
+function fail(status, identity, message)
+{
+  const error = new Error(message);
+  error.status = status;
+  error.identity = identity;
+  return error;
+}
+
+function mkdirPrivate(directory)
+{
+  fs.mkdirSync(directory, {mode:0o700});
+  fs.chmodSync(directory, 0o700);
+}
+
+function writePrivate(file, data)
+{
+  fs.writeFileSync(file, data, {flag:'wx', mode:0o600});
+  fs.chmodSync(file, 0o600);
+}
+
+function progress(identity, detail)
+{
+  process.stderr.write(`web-export.${identity}: ${detail}\n`);
+}
+
+function parseUrl(value)
+{
+  let url;
+  try {url = new URL(value);}
+  catch (_) {throw fail(4, 'invalid-url', 'the first operand must be an absolute HTTP(S) URL');}
+  if (!['http:', 'https:'].includes(url.protocol))
+    throw fail(5, 'unsupported-url-scheme', 'only HTTP and HTTPS URLs can be exported');
+  return url;
+}
+
+function savedRows(directory)
+{
+  const file = path.join(directory, 'resources.jsonl');
+  let text;
+  try {text = fs.readFileSync(file, 'utf8');}
+  catch (error) {throw fail(10, 'resource-index-unavailable',
+    'the browser capture did not produce a resource index: ' + error.message);}
+  return text.split(/\r?\n/).filter(Boolean).map((line, index) => {
+    try {return JSON.parse(line);}
+    catch (_) {throw fail(11, 'resource-index-invalid',
+      'the browser resource index contains invalid JSON at row ' + (index + 1));}
+  });
+}
+
+function mimeExtension(mime, kind, body)
+{
+  const value = String(mime || '').split(';', 1)[0].trim().toLowerCase();
+  const known = {
+    'text/css':'.css', 'image/png':'.png', 'image/jpeg':'.jpg',
+    'text/javascript':'.js', 'application/javascript':'.js',
+    'application/x-javascript':'.js', 'text/ecmascript':'.js',
+    'application/ecmascript':'.js', 'application/wasm':'.wasm',
+    'image/gif':'.gif', 'image/webp':'.webp', 'image/avif':'.avif',
+    'image/svg+xml':'.svg', 'image/x-icon':'.ico', 'image/vnd.microsoft.icon':'.ico',
+    'font/woff':'.woff', 'font/woff2':'.woff2', 'application/font-woff':'.woff',
+    'application/font-woff2':'.woff2', 'application/vnd.ms-fontobject':'.eot',
+    'application/x-font-ttf':'.ttf', 'font/ttf':'.ttf', 'font/otf':'.otf',
+    'text/vtt':'.vtt', 'audio/mpeg':'.mp3', 'audio/ogg':'.ogg', 'audio/wav':'.wav',
+    'video/mp4':'.mp4', 'video/webm':'.webm'
+  };
+  if (known[value]) return known[value];
+  if (kind === 'stylesheet') return '.css';
+  if (kind === 'image')
+  {
+    if (body.subarray(0,8).equals(Buffer.from([137,80,78,71,13,10,26,10]))) return '.png';
+    if (body[0] === 0xff && body[1] === 0xd8 && body[2] === 0xff) return '.jpg';
+    if (body.toString('ascii',0,3) === 'GIF') return '.gif';
+    if (body.toString('ascii',0,4) === 'RIFF' && body.toString('ascii',8,12) === 'WEBP') return '.webp';
+    if (/^\s*(?:<\?xml[^>]*>\s*)?<svg\b/i.test(body.toString('utf8',0,256))) return '.svg';
+  }
+  if (kind === 'font')
+  {
+    if (body.toString('ascii',0,4) === 'wOF2') return '.woff2';
+    if (body.toString('ascii',0,4) === 'wOFF') return '.woff';
+    if (body.toString('ascii',0,4) === 'OTTO') return '.otf';
+    if (body.subarray(0,4).equals(Buffer.from([0,1,0,0]))) return '.ttf';
+  }
+  return '.bin';
+}
+
+function assetKind(row)
+{
+  const mime = String(row.mimeType || '').split(';', 1)[0].trim().toLowerCase();
+  if (mime === 'text/css' || row.resourceType === 'Stylesheet') return 'stylesheet';
+  if (mime === 'text/javascript' || mime === 'application/javascript' ||
+      mime === 'application/x-javascript' || mime === 'text/ecmascript' ||
+      mime === 'application/ecmascript' || row.resourceType === 'Script') return 'script';
+  if (mime.startsWith('image/')) return 'image';
+  if (mime.startsWith('font/') || /font|woff|opentype|truetype/.test(mime)) return 'font';
+  if (mime === 'text/vtt' || row.resourceType === 'TextTrack') return 'media';
+  if (mime.startsWith('audio/') || mime.startsWith('video/')) return 'media';
+  if (['Image','Font','Media'].includes(row.resourceType)) return row.resourceType.toLowerCase();
+  return null;
+}
+
+function collectAssets(runDirectory, targetDirectory)
+{
+  const rows = savedRows(runDirectory);
+  const candidates = new Map();
+  let bytesTotal = 0;
+  let rejectedBodies = 0;
+  const countedBodies = new Set();
+
+  const add = (urlValue, mimeType, resourceType, relativeFile, expectedSha, expectedBytes, origin,
+    httpStatus) => {
+    let url;
+    try {url = new URL(urlValue);} catch (_) {return;}
+    if (!['http:','https:'].includes(url.protocol)) return;
+    url.hash = '';
+    const kind = assetKind({mimeType,resourceType});
+    if (!kind) return;
+    if (Number.isFinite(httpStatus) &&
+        (httpStatus >= 400 || (httpStatus >= 300 && httpStatus < 400 && httpStatus !== 304)))
+    { rejectedBodies++; return; }
+    const source = path.resolve(runDirectory, relativeFile);
+    if (!source.startsWith(path.resolve(runDirectory) + path.sep) || !fs.existsSync(source))
+    { rejectedBodies++; return; }
+    const body = fs.readFileSync(source);
+    if (!body.length && kind !== 'stylesheet')
+    { rejectedBodies++; return; }
+    const hash = crypto.createHash('sha256').update(body).digest('hex');
+    if (hash !== expectedSha || body.length !== expectedBytes)
+    { rejectedBodies++; return; }
+    if (!countedBodies.has(hash))
+    {
+      countedBodies.add(hash);
+      bytesTotal += body.length;
+    }
+    if (bytesTotal > MAX_ASSET_BYTES)
+      throw fail(14, 'asset-size-limit', 'captured visual assets exceed the 512 MiB export limit');
+    const extension = mimeExtension(mimeType,kind,body);
+    const filename = hash + (kind === 'stylesheet' ?
+      '-' + crypto.createHash('sha256').update(url.href).digest('hex').slice(0,12) + '.css' :
+      extension);
+    const previous = candidates.get(url.href) || [];
+    previous.push({filename, hash, mimeType, kind, origin, body,sourceUrl:url.href});
+    candidates.set(url.href, previous);
+  };
+
+  for (const row of rows)
+  {
+    if (row.status !== 'saved' || !row.file || !row.url) continue;
+    const kind = assetKind(row);
+    if (!kind) continue;
+    add(row.url, row.mimeType, row.resourceType, row.file, row.sha256, row.bytes,
+      'http-body', row.httpStatus);
+  }
+
+  const output = new Map();
+  let ambiguous = 0;
+  for (const [url, versions] of candidates)
+  {
+    const hashes = new Set(versions.map(item => item.hash));
+    if (hashes.size > 1)
+    {
+      ambiguous++;
+      continue;
+    }
+    output.set(url, versions.at(-1));
+  }
+
+  const uniqueItems = new Map([...output.values()].map(item => [item.filename,item]));
+  mkdirPrivate(path.join(targetDirectory, 'assets'));
+  for (const item of uniqueItems.values())
+  {
+    const dest = path.join(targetDirectory, 'assets', item.filename);
+    if (!fs.existsSync(dest)) writePrivate(dest, item.body);
+  }
+  return {map:Object.fromEntries([...output].map(([url,item]) => [url,item.filename])),
+    assets:[...uniqueItems.values()].map(item => ({file:'assets/' + item.filename,
+      sha256:item.hash,bytes:item.body.length,kind:item.kind,source:item.origin})),
+    selectedAssets:[...uniqueItems.values()],
+    ambiguous,rejectedBodies,sourceRows:rows.length};
+}
+
+function resolveAssetReference(value, base, map, assetDirectory)
+{
+  const raw = decodeHtmlAttribute(String(value || '').trim());
+  if (!raw || raw[0] === '#' || /^data:/i.test(raw)) return null;
+
+  let url;
+  try {url = new URL(raw, base);}
+  catch (_) {return null;}
+  if (!['http:', 'https:'].includes(url.protocol)) return null;
+  const fragment = url.hash;
+  url.hash = '';
+  const filename = map[url.href];
+  if (!filename) return null;
+  return {
+    filename,
+    local:require('node:url').pathToFileURL(path.join(assetDirectory, filename)).href + fragment
+  };
+}
+
+function decodeHtmlAttribute(value)
+{
+  const decodeOnce = text => text.replace(/&(?:amp|quot|apos|lt|gt|#(?:x[0-9a-f]+|[0-9]+));/gi, entity => {
+    const key = entity.toLowerCase();
+    const named=({'&amp;':'&','&quot;':'"','&apos;':"'",'&lt;':'<','&gt;':'>'})[key];
+    if(named!==undefined)return named;
+    const hexadecimal=/^&#x/i.test(entity);
+    const digits=entity.slice(hexadecimal?3:2,-1);
+    const codepoint=Number.parseInt(digits,hexadecimal?16:10);
+    if(!Number.isInteger(codepoint)||codepoint<=0||codepoint>0x10ffff||
+        (codepoint>=0xd800&&codepoint<=0xdfff))return entity;
+    return String.fromCodePoint(codepoint);
+  });
+  return decodeOnce(value);
+}
+
+function rewriteCssReferences(input, base, map, assetDirectory)
+{
+  const text=String(input||'');
+  const edits=[];
+  let rewritten=0;
+  let unmapped=0;
+  const parentheses=[];
+  let imageSetPending=false;
+  let importPending=false;
+  const applyReference=(start,end,value)=>{
+    const reference=resolveAssetReference(value,base,map,assetDirectory);
+    if(reference)
+    {
+      edits.push({start,end,value:reference.local});
+      rewritten++;
+    }
+    else
+    {
+      try {if(['http:','https:'].includes(new URL(value,base).protocol)) unmapped++;}
+      catch (_) {}
+    }
+  };
+  const quotedEnd=start=>{
+    const quote=text[start];
+    let index=start+1;
+    while(index<text.length)
+    {
+      if(text[index]==='\\'){index+=2;continue;}
+      if(text[index]===quote)return index;
+      index++;
+    }
+    return -1;
+  };
+  let index=0;
+  while(index<text.length)
+  {
+    if(text.startsWith('/*',index))
+    {
+      const end=text.indexOf('*/',index+2);
+      index=end<0?text.length:end+2;
+      continue;
+    }
+    const ch=text[index];
+    if(ch==='"'||ch==="'")
+    {
+      const end=quotedEnd(index);
+      if(end<0)break;
+      if(importPending||parentheses.includes(true))applyReference(index+1,end,text.slice(index+1,end));
+      importPending=false;
+      index=end+1;
+      continue;
+    }
+    if(ch==='@'&&/^@import\b/i.test(text.slice(index)))
+    {
+      importPending=true;
+      index+=7;
+      continue;
+    }
+    if(/[a-z_-]/i.test(ch))
+    {
+      const start=index;
+      while(index<text.length&&/[a-z0-9_-]/i.test(text[index]))index++;
+      const name=text.slice(start,index).toLowerCase();
+      let next=index;
+      while(next<text.length&&/\s/.test(text[next]))next++;
+      if(name==='url'&&text[next]==='(')
+      {
+        let valueStart=next+1;
+        while(valueStart<text.length&&/\s/.test(text[valueStart]))valueStart++;
+        if(text[valueStart]==='"'||text[valueStart]==="'")
+        {
+          const end=quotedEnd(valueStart);
+          if(end<0)break;
+          let close=end+1;
+          while(close<text.length&&/\s/.test(text[close]))close++;
+          if(text[close]===')')
+          {
+            applyReference(valueStart+1,end,text.slice(valueStart+1,end));
+            index=close+1;
+            importPending=false;
+            continue;
+          }
+        }
+        else
+        {
+          let close=valueStart;
+          while(close<text.length&&text[close]!==')')close++;
+          if(close<text.length)
+          {
+            let valueEnd=close;
+            while(valueEnd>valueStart&&/\s/.test(text[valueEnd-1]))valueEnd--;
+            applyReference(valueStart,valueEnd,text.slice(valueStart,valueEnd));
+            index=close+1;
+            importPending=false;
+            continue;
+          }
+        }
+      }
+      if(name==='image-set'||name==='-webkit-image-set')imageSetPending=true;
+      importPending=false;
+      index=start+(index-start);
+      continue;
+    }
+    if(ch==='(')
+    {
+      parentheses.push(imageSetPending);
+      imageSetPending=false;
+      importPending=false;
+    }
+    else if(ch===')')
+    {
+      parentheses.pop();
+      importPending=false;
+    }
+    else if(ch===';')importPending=false;
+    else if(!/\s/.test(ch))importPending=false;
+    index++;
+  }
+  edits.sort((left,right)=>right.start-left.start);
+  let output=text;
+  for(const edit of edits)output=output.slice(0,edit.start)+edit.value+output.slice(edit.end);
+  return {text:output,rewritten,unmapped};
+}
+
+function updateIntegrity(value, hashes)
+{
+  return String(value).replace(/\b(sha256|sha384|sha512)-([A-Za-z0-9+/=]+)(\?[^\s]+)?/g,
+    (token,algorithm,oldHash,options)=>algorithm+'-'+hashes[algorithm]+(options||''));
+}
+
+function parseHtmlStartTag(html, start)
+{
+  if (html.startsWith('<!--', start))
+  {
+    const close = html.indexOf('-->', start + 4);
+    return {comment:true, end:close < 0 ? html.length : close + 3};
+  }
+  if (html[start + 1] === '!' || html[start + 1] === '?')
+  {
+    const end = html.indexOf('>', start + 2);
+    return {declaration:true, end:end < 0 ? html.length : end + 1};
+  }
+
+  let quote = '';
+  let end = start + 1;
+  for (; end < html.length; end++)
+  {
+    const ch = html[end];
+    if (quote)
+    {
+      if (ch === quote) quote = '';
+    }
+    else if (ch === '"' || ch === "'") quote = ch;
+    else if (ch === '>') break;
+  }
+  if (end >= html.length) return {declaration:true, end:html.length};
+
+  const tagText = html.slice(start, end + 1);
+  const nameMatch = /^<\s*([^\s/>]+)/.exec(tagText);
+  if (!nameMatch) return {declaration:true, end:end + 1};
+  const closing = /^<\s*\//.test(tagText);
+  const name = nameMatch[1].toLowerCase();
+  const attributes = [];
+  if (!closing)
+  {
+    let cursor = nameMatch[0].length;
+    while (cursor < tagText.length - 1)
+    {
+      while (cursor < tagText.length - 1 && /[\s/]/.test(tagText[cursor])) cursor++;
+      const nameStart = cursor;
+      while (cursor < tagText.length - 1 && !/[\s=/>]/.test(tagText[cursor])) cursor++;
+      if (cursor === nameStart) {cursor++; continue;}
+      const attributeName = tagText.slice(nameStart, cursor).toLowerCase();
+      while (cursor < tagText.length - 1 && /\s/.test(tagText[cursor])) cursor++;
+      if (tagText[cursor] !== '=') continue;
+      cursor++;
+      while (cursor < tagText.length - 1 && /\s/.test(tagText[cursor])) cursor++;
+      const delimiter = tagText[cursor];
+      let valueStart;
+      let valueEnd;
+      if (delimiter === '"' || delimiter === "'")
+      {
+        cursor++;
+        valueStart = cursor;
+        while (cursor < tagText.length - 1 && tagText[cursor] !== delimiter) cursor++;
+        valueEnd = cursor;
+        if (tagText[cursor] === delimiter) cursor++;
+      }
+      else
+      {
+        valueStart = cursor;
+        while (cursor < tagText.length - 1 && !/[\s>]/.test(tagText[cursor])) cursor++;
+        valueEnd = cursor;
+      }
+      attributes.push({name:attributeName, value:tagText.slice(valueStart,valueEnd),
+        start:start + valueStart, end:start + valueEnd});
+    }
+  }
+  return {name, closing, end:end + 1, tagEnd:end, attributes};
+}
+
+function findRawTextEnd(html, name, start)
+{
+  const matcher = new RegExp('</\\s*' + name + '\\s*>', 'ig');
+  matcher.lastIndex = start;
+  const match = matcher.exec(html);
+  return match ? {start:match.index, end:matcher.lastIndex} : null;
+}
+
+function isRelinkableHref(tag, attributes)
+{
+  if(tag.name!=='link')return !['a','area','base'].includes(tag.name);
+  const rel=String(attributes.get('rel')?.value||'').toLowerCase().split(/\s+/);
+  return rel.some(value=>['stylesheet','icon','mask-icon','apple-touch-icon',
+    'apple-touch-icon-precomposed','manifest','preload','modulepreload','prefetch',
+    'prerender','shortcut'].includes(value));
+}
+
+function rewriteHtmlReferences(html, sourceUrl, map, assetDirectory, stylesheetIntegrity)
+{
+  const edits = [];
+  const counts = {htmlReferences:0,cssReferences:0,scriptElements:0,
+    inlineHandlers:0,unmappedReferences:0,unmappedCssReferences:0};
+  const source = new URL(sourceUrl).href;
+  let base = source;
+  let baseSeen = false;
+  let cursor = 0;
+
+  const addEdit = (start, end, value) => {
+    if (value !== null && value !== html.slice(start, end))
+      edits.push({start,end,value});
+  };
+
+  while (cursor < html.length)
+  {
+    const start = html.indexOf('<', cursor);
+    if (start < 0) break;
+    const tag = parseHtmlStartTag(html, start);
+    if (!tag) {cursor = start + 1; continue;}
+    cursor = tag.end;
+    if (tag.comment || tag.declaration || tag.closing) continue;
+
+    if (tag.name === 'script') counts.scriptElements++;
+    const attributeByName = new Map(tag.attributes.map(attribute => [attribute.name,attribute]));
+    const baseAttribute = tag.name === 'base' ? attributeByName.get('href') : null;
+    if (baseAttribute && !baseSeen)
+    {
+      try {base = new URL(decodeHtmlAttribute(baseAttribute.value), base).href; baseSeen = true;}
+      catch (_) {}
+    }
+
+    let linkedStylesheet = null;
+    for (const attribute of tag.attributes)
+    {
+      const name = attribute.name;
+      if (name.startsWith('on')) counts.inlineHandlers++;
+
+      if (name === 'style')
+      {
+        const encoded = attribute.value;
+        const decoded = decodeHtmlAttribute(encoded);
+        const transformed = rewriteCssReferences(decoded,base,map,assetDirectory);
+        counts.cssReferences += transformed.rewritten;
+        counts.unmappedCssReferences += transformed.unmapped;
+        if (transformed.text !== decoded)
+        {
+          const escaped = transformed.text.replace(/&/g,'&amp;').replace(/"/g,'&quot;')
+            .replace(/'/g,'&#39;');
+          addEdit(attribute.start,attribute.end,escaped);
+        }
+        continue;
+      }
+
+      if (name === 'srcset')
+      {
+        const result = rewriteSrcsetReferences(attribute.value, base, map, assetDirectory);
+        counts.htmlReferences += result.rewritten;
+        addEdit(attribute.start, attribute.end, result.text);
+        counts.unmappedReferences += result.unmapped;
+        continue;
+      }
+
+      if (tag.name==='link' && name==='integrity') continue;
+
+      const resourceAttribute = ['src','poster','data','background','xlink:href','manifest'].includes(name) ||
+        (name === 'href' && isRelinkableHref(tag,attributeByName));
+      if (!resourceAttribute) continue;
+      const reference = resolveAssetReference(attribute.value, base, map, assetDirectory);
+      if (reference)
+      {
+        counts.htmlReferences++;
+        addEdit(attribute.start, attribute.end, reference.local);
+        if(tag.name==='link' && name==='href')
+          linkedStylesheet=reference.filename;
+      }
+      else if (/^https?:/i.test(attribute.value) ||
+          /^[./][^#]/.test(attribute.value))
+        counts.unmappedReferences++;
+    }
+
+    if(linkedStylesheet && attributeByName.has('integrity'))
+    {
+      const hashes=stylesheetIntegrity.get(linkedStylesheet);
+      if(hashes)
+      {
+        const integrity=attributeByName.get('integrity');
+        addEdit(integrity.start,integrity.end,updateIntegrity(integrity.value,hashes));
+      }
+    }
+
+    if (tag.name === 'style')
+    {
+      const close = findRawTextEnd(html, 'style', tag.end);
+      if (close)
+      {
+        const original=html.slice(tag.end,close.start);
+        const result=rewriteCssReferences(original,base,map,assetDirectory);
+        counts.cssReferences+=result.rewritten;
+        counts.unmappedCssReferences+=result.unmapped;
+        addEdit(tag.end,close.start,result.text);
+        cursor = close.end;
+      }
+      else cursor = html.length;
+    }
+    else if (tag.name === 'plaintext')
+    {
+      cursor = html.length;
+    }
+    else if (['script','textarea','title','xmp','noembed','noframes']
+      .includes(tag.name))
+    {
+      const close = findRawTextEnd(html, tag.name, tag.end);
+      cursor = close ? close.end : html.length;
+    }
+  }
+
+  edits.sort((left,right) => right.start - left.start);
+  let output = html;
+  for (const edit of edits)
+    output = output.slice(0,edit.start) + edit.value + output.slice(edit.end);
+  return {html:output,counts};
+}
+
+function rewriteSrcsetReferences(value, base, map, assetDirectory)
+{
+  const edits = [];
+  let rewritten = 0;
+  let unmapped = 0;
+  let index = 0;
+  while (index < value.length)
+  {
+    while (index < value.length && /[\s,]/.test(value[index])) index++;
+    if (index >= value.length) break;
+    const start = index;
+    while (index < value.length && !/\s/.test(value[index])) index++;
+    const tokenEnd = index;
+    let referenceEnd = tokenEnd;
+    let reference = value.slice(start, tokenEnd);
+    while (reference.endsWith(','))
+    {
+      reference = reference.slice(0,-1);
+      referenceEnd--;
+    }
+    if (referenceEnd === tokenEnd)
+    {
+      while (index < value.length && /\s/.test(value[index])) index++;
+      while (index < value.length && value[index] !== ',') index++;
+      if (value[index] === ',') index++;
+    }
+    else index = tokenEnd;
+    if (!reference) continue;
+
+    const asset = resolveAssetReference(reference, base, map, assetDirectory);
+    if (asset)
+    {
+      edits.push({start,end:referenceEnd,value:asset.local});
+      rewritten++;
+    }
+    else if (/^https?:/i.test(reference)) unmapped++;
+  }
+  edits.sort((left,right) => right.start - left.start);
+  let output = value;
+  for (const edit of edits)
+    output = output.slice(0,edit.start) + edit.value + output.slice(edit.end);
+  return {text:output,rewritten,unmapped};
+}
+
+function writeTransformedAssets(assets, map, assetDirectory)
+{
+  const integrity = new Map();
+  let rewrittenCssReferences = 0;
+  let unmappedCssReferences = 0;
+  for (const asset of assets)
+  {
+    if (asset.kind === 'stylesheet')
+    {
+      const original=asset.body.toString('utf8');
+      const result=rewriteCssReferences(original,asset.sourceUrl,map,assetDirectory);
+      rewrittenCssReferences+=result.rewritten;
+      unmappedCssReferences+=result.unmapped;
+      if(result.text!==original)
+      {
+        asset.sourceSha256=asset.hash;
+        asset.body=Buffer.from(result.text,'utf8');
+        asset.hash=crypto.createHash('sha256').update(asset.body).digest('hex');
+        integrity.set(asset.filename,{
+          sha256:crypto.createHash('sha256').update(asset.body).digest('base64'),
+          sha384:crypto.createHash('sha384').update(asset.body).digest('base64'),
+          sha512:crypto.createHash('sha512').update(asset.body).digest('base64')
+        });
+      }
+    }
+    const destination=path.join(assetDirectory,asset.filename);
+    fs.writeFileSync(destination,asset.body,{mode:0o600});
+    fs.chmodSync(destination,0o600);
+  }
+  return {integrity,rewrittenCssReferences,unmappedCssReferences};
+}
+
+function transformCapturedDocument(html, sourceUrl, collected, outputDirectory)
+{
+  const assetDirectory = path.join(outputDirectory, 'assets');
+  const assets=writeTransformedAssets(collected.selectedAssets,collected.map,assetDirectory);
+  const transformed = rewriteHtmlReferences(html, sourceUrl, collected.map,
+    assetDirectory,assets.integrity);
+  transformed.counts.cssReferences+=assets.rewrittenCssReferences;
+  transformed.counts.unmappedCssReferences+=assets.unmappedCssReferences;
+  return {html:transformed.html,counts:transformed.counts,
+    cssIntegrity:assets.integrity};
+}
+
+function writeCapturedExport(captured, sourceUrl, outputDirectory)
+{
+  if (Buffer.byteLength(captured.html) > MAX_HTML_BYTES)
+    throw fail(15, 'rendered-html-size-limit', 'rendered HTML exceeds the 32 MiB export limit');
+  const collected = collectAssets(captured.runDirectory, outputDirectory);
+  const transformed = transformCapturedDocument(captured.html, sourceUrl, collected, outputDirectory);
+  writePrivate(path.join(outputDirectory,'index.html'), transformed.html);
+
+  const assets = collected.selectedAssets.map(item=>({file:'assets/'+item.filename,
+    sha256:item.hash,bytes:item.body.length,kind:item.kind,source:item.origin,
+    ...(item.sourceSha256?{sourceSha256:item.sourceSha256}:{})}));
+  const htmlBytes = Buffer.byteLength(transformed.html);
+  const scriptCount = transformed.counts.scriptElements;
+  const manifest = {
+    format:'web-export/2',mode:'standalone-file',scripts:'preserved',generatedScripts:[],
+    source:{origin:new URL(sourceUrl).origin,path:new URL(sourceUrl).pathname},
+    document:{file:'index.html',sha256:crypto.createHash('sha256')
+      .update(transformed.html).digest('hex'),bytes:htmlBytes},
+    assets,
+    coverage:{resourceRows:collected.sourceRows,assets:assets.length,
+      capturedAssets:collected.assets.length,ambiguousAssetUrls:collected.ambiguous,
+      unverifiedBodies:collected.rejectedBodies,scriptElementsPreserved:scriptCount,
+      inlineHandlersPreserved:transformed.counts.inlineHandlers,
+      htmlReferencesRelinked:transformed.counts.htmlReferences,
+      cssReferencesRelinked:transformed.counts.cssReferences,
+      htmlReferencesUnmapped:transformed.counts.unmappedReferences,
+      cssReferencesUnmapped:transformed.counts.unmappedCssReferences},
+    limitations:['Source scripts and their behavior are preserved unchanged.',
+      'Network resources without a verified captured response body retain their original URL.',
+      'Interactions that need remote APIs or authenticated server state still need that service.']
+  };
+  writePrivate(path.join(outputDirectory,'manifest.json'),JSON.stringify(manifest,null,2) + '\n');
+  return manifest;
+}
+
+function capture(url, temporary)
+{
+  const script = path.join(__dirname, 'web-analyze');
+  const result = spawnSync(process.execPath, [script, url.href, temporary, '--scroll'], {
+    encoding:'utf8',timeout:600000,maxBuffer:8 * 1024 * 1024,env:{...process.env}
+  });
+  if (result.error || result.status !== 0)
+  {
+    const identity = String(result.stderr || '').match(/(?:^|\n)web-analyze\.([a-z0-9-]+):/i)?.[1];
+    const cause = result.error ? ': ' + result.error.message :
+      ' (exit ' + result.status + (identity ? ', ' + identity : '') + ')';
+    throw fail(8, 'browser-capture-failed', 'web-analyze could not capture the page' +
+      cause);
+  }
+  const match = result.stdout.match(/(?:^|\n)([^\r\n]+\/README\.md)\s*$/);
+  if (!match) throw fail(9, 'browser-capture-path-missing',
+    'web-analyze did not report its completed capture directory');
+  const runDirectory = path.dirname(match[1]);
+  const htmlFile = path.join(runDirectory, 'states', 'dom-rest-final.html');
+  let html;
+  try {html = fs.readFileSync(htmlFile, 'utf8');}
+  catch (error) {throw fail(12, 'rendered-document-unavailable',
+    'the final rendered document was not saved: ' + error.message);}
+  if (!html.trim()) throw fail(13, 'rendered-document-empty',
+    'the browser capture produced an empty rendered document');
+  let scrollMetadataAvailable = false;
+  let scrollPositions = [];
+  let scrollPositionsTruncated = false;
+  const scrollMetadata = path.join(runDirectory,'states','dom-rest-final.json');
+  try
+  {
+    const metadata = JSON.parse(fs.readFileSync(scrollMetadata,'utf8'));
+    if (Array.isArray(metadata.scrollPositions))
+    {
+      scrollMetadataAvailable = true;
+      scrollPositions = metadata.scrollPositions.filter(item =>
+        item && typeof item.selector === 'string' &&
+        /^(?:[a-z][a-z0-9-]*:nth-of-type\(\d+\))(?: > [a-z][a-z0-9-]*:nth-of-type\(\d+\))*$/i.test(item.selector) &&
+        Number.isFinite(item.top) && Number.isFinite(item.left) &&
+        Math.abs(item.top) <= 1_000_000_000 && Math.abs(item.left) <= 1_000_000_000)
+        .slice(0,256).map(item => ({selector:item.selector,top:item.top,left:item.left}));
+      scrollPositionsTruncated = !!metadata.scrollPositionsTruncated;
+    }
+  }
+  catch (_) {}
+  return {runDirectory,html,scrollMetadataAvailable,scrollPositions,scrollPositionsTruncated};
+}
+
+function main(args)
+{
+  if (!process.env.m_ROOT)
+    throw fail(1, 'm-environment-missing', 'invoke through m or initialize m_ROOT first');
+  if (!process.env.m_LIB_DIR)
+    throw fail(2, 'm-library-root-missing', 'the initialized environment does not define m_LIB_DIR');
+  if (args.length !== 2 || args.some(value => !value))
+    throw fail(3, 'invalid-arguments', 'usage: web-export <http(s)-url> <export-directory>');
+  const url = parseUrl(args[0]);
+  const output = path.resolve(args[1]);
+  const parent = path.dirname(output);
+  try {fs.mkdirSync(parent, {recursive:true,mode:0o700});}
+  catch (error) {throw fail(6, 'output-parent-unavailable',
+    'cannot create the export parent directory: ' + error.message);}
+  try {mkdirPrivate(output);}
+  catch (error) {throw fail(7, 'output-directory-unavailable',
+    'export directory must be new and must not already exist: ' + error.message);}
+  const temporary = fs.mkdtempSync(path.join(os.tmpdir(), 'web-export-'));
+  fs.chmodSync(temporary, 0o700);
+  let completed = false;
+  try
+  {
+    progress('capture-started', 'starting the bounded rendered-page capture');
+    const captured = capture(url, path.join(temporary, 'capture'));
+    progress('capture-finished', 'captured rendered HTML and indexed responses');
+    const manifest = writeCapturedExport(captured,url.href,output);
+    fs.rmSync(temporary,{recursive:true,force:true});
+    completed = true;
+    progress('export-written', `${output}: ${manifest.assets.length} assets, ` +
+      `${manifest.coverage.htmlReferencesUnmapped + manifest.coverage.cssReferencesUnmapped} uncaptured references left unchanged`);
+    process.stdout.write(path.join(output,'index.html') + '\n');
+    return 0;
+  }
+  finally
+  {
+    const cleanupErrors=[];
+    try {fs.rmSync(temporary,{recursive:true,force:true});}
+    catch (error) {cleanupErrors.push('temporary capture: ' + error.message)}
+    if (!completed)
+    {
+      try {fs.rmSync(output,{recursive:true,force:true});}
+      catch (error) {cleanupErrors.push('partial export: ' + error.message)}
+    }
+    if(cleanupErrors.length)throw fail(19,'private-data-cleanup-failed',
+      'could not remove private temporary data at '+temporary+' ('+cleanupErrors.join('; ')+')');
+  }
+}
+
+if (require.main === module)
+{
+  try {process.exitCode = main(process.argv.slice(2));}
+  catch (error)
+  {
+    process.stderr.write(`web-export.${error.identity || 'unexpected-failure'}: ${error.message}\n`);
+    process.exitCode = error.status || 20;
+  }
+}
+else module.exports = {transformCapturedDocument,writeCapturedExport};
