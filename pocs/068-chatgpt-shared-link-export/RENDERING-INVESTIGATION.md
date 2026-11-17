@@ -1,0 +1,652 @@
+# PoC 068 — ChatGPT shared-page rendering mechanism
+
+Status: Experimental evidence, not an RumiAI interface or a stable ChatGPT contract.
+Source: committed real-browser capture at `rumiai-dev-PoCs@cfc4533627382bb0e339ea1c424eb96d1f88b123`, in `analysis-chromium-resources-02`. No history lookup and no new live capture in this analysis.
+
+## Reproducible source attribution
+
+The two particularly relevant **compiled** JavaScript resources in `scripts.jsonl` are:
+
+| Captured asset URL basename | Content-addressed file | Git blob SHA | Role observed |
+|---|---|---|---|
+| `8b34dbc2-i6mnaw2f0obqfl0x.js` | `scripts/082eaa5e9e0e8547ce0633aed3766333d588e8eebf60d57f3715f1a68354ba6a.js` | `7287982fb205398a8460c37984f3aaa1fd2254d6` | Turn rendering, intersection-driven child mounting, render-coordinator |
+| `conversation-small-fcu1fuggk1duh76x.js` | `scripts/d87462a803a961d4625067bad08fd48971020bfb7f6f6b3dfdcbf3933c01c84c.js` | `4e31b5fed07b29a27a5068b2b11b1b56d23b0f7d` | Scroll-root event registration and DOM queries by original IDs |
+
+These generated symbol names and constants are specific to **this** captured build. Git blob SHA gives the exact revision independent of changing production asset filenames.
+
+## Identified rendering chain
+
+1. **Identity:** the message JSX sets `data-message-id` from `message.id`. The turn `section` sets `data-turn-id` and `data-turn-id-container` from `turn.id`, with `data-testid` derived from `conversation-turn-` plus turn ordinal. The outer virtualized turn `div` also holds `data-turn-id-container` and `data-is-intersecting`. Multiple nested nodes may share a turn ID; never assume there is only one matching element.
+2. **Virtual turn implementation:** minified function `a5n` in the `8b34...` compiled asset receives `intersectionObserver`, `alwaysShow`, `forceRender`, `onIntersectingChange`, `turnId` and `turnIndex`. It calls the supplied observer's `observe` method, handles visibility callbacks, sets local React state, and calls `onIntersectingChange`. When content is not enabled, its child JSX is `null`; a wrapper can remain with `--estimated-turn-height` and/or `--last-known-height`.
+3. **Rendering exceptions:** the calling component renders the final five turns unconditionally, and turns within ±5 positions of the selected reference index. It also supplies explicit `forceRender` for selected/targeted turns. Special content groups can trigger additional always-render conditions. These are observed build constants, not general guarantees.
+4. **Coordinator and geometry:** the calling component (observed near minified `tpr`) maintains a set of currently intersecting turn IDs. The `onIntersectingChange` callback updates that set and its reference index; a layout-preservation step finds a turn by `data-turn-id-container` and corrects the real scroll container's `scrollTop` after reflow to retain the user's visual anchor.
+5. **Actual scroll-root listener:** in the `conversation-small...` asset, function `QNe` registers a native `scroll` listener and toggles `data-scroll-from-top` using the element's own `scrollTop`, not `window.scrollY`. Scroll-to-message behavior queries `data-message-id` first and falls back to `data-turn-id-container`.
+
+The application uses an observer adapter (its exposed `observe` is not necessarily a raw `IntersectionObserver`). We must distinguish the adapter callback from the native browser observer's callback instead of claiming their equivalence without runtime instrumentation.
+
+## Comparison with physical capture
+
+The new `summary.json` reports 4,768 events, including 1,063 DOM mutation batches, 1,066 interaction events, 1,882 network events and 666 performance events, with no declared dropped event records. Its DOM batches aggregate 1,994 added nodes, 821 removed nodes and 1,758 attribute changes. There are 256 captured `scroll` events.
+
+The capture also archived 614 response bodies (40,498,763 bytes) and 530 parsed-script source events (525 distinct source files). These counts validate substantial source coverage, **not** perfect completeness.
+
+The existing `web-analyze` DOM mutation samples omit individual node IDs, and its scroll records contain `window.scrollY` instead of the target container's `scrollTop`. Therefore the original event stream cannot independently prove which `data-turn-id-container` gained/lost content after each observer notification. Static source analysis plus temporal correlation cannot conclusively attribute a particular mutation to a specific callback.
+
+## Controlled experiment required to establish causality
+
+- Inject observation **before initial page navigation**, recording native `IntersectionObserver` and `ResizeObserver` constructions, registrations and callback notifications with their root/options/target turn IDs. Record listener-registration callsites for `scroll`, `wheel` and `resize`, avoiding password, request-body and token capture in diagnostic logs.
+- At runtime identify the actual `[data-scroll-root]` element and record `scrollTop`, `scrollHeight`, `clientHeight`, element bounds and a stable DOM locator. Change **real element.scrollTop** incrementally in each direction; synthetic dispatch of a `scroll` event alone does not change geometry or establish an observer transition.
+- Observe every `[data-turn-id-container]` placeholder and its descendant `[data-message-id]` nodes. For each transition, correlate observer notification, wrapper `data-is-intersecting`, added/removed descendants, outerHTML snapshot, message IDs and height. Capture full rendered turn HTML before virtualization removes it, without assuming that HTML alone preserves interactive behavior.
+- Compare observed message IDs with the independently verified `chatgpt-export.lib.js` RAW transcript; report missing turns, repeated IDs, unrendered special components, resource failures and snapshots that exceeded explicit size limits. Only then attempt assembling an offline DOM replica.
+- Preserve the existing Markdown baseline at `rumiai-os@17077e469469f11dddb66a530a1692a663ba9fcb`; a rendering probe belongs to this PoC until its behavior is verified.
+
+## Executable controlled observer probe
+
+The independently instrumented experimental entrypoint is `render-probe.mjs`. It launches Chromium from PATH via native loopback TCP CDP, injects a probe using `Page.addScriptToEvaluateOnNewDocument` **before initial navigation**, and captures:
+- `listener.register` for scroll/wheel/resize listener registration;
+- `intersection.create`, `intersection.observe`, `intersection.callback`;
+- `resize.create`, `resize.observe`, `resize.callback`;
+- `scroll.actual` with the scroll target's true scrollTop, scrollHeight and clientHeight;
+- `dom.mutation` with affected turn IDs and counts;
+- `turn.snapshot` with turn ID, descendant message IDs, and content-addressed full outerHTML files in `turns/` (per snapshot maximum 2 MiB; oversize explicitly reported).
+- `turn.initial` for the first observed wrapper state, `turn.content-mounted` and `turn.content-unmounted` for observable changes in descendant message presence, and `turn.wrapper-removed` if the wrapper itself vanishes. These are observation-frame transitions, **not** direct instrumented React lifecycle hooks; changes occurring entirely between capture frames can be missed. Transition records preserve original turn/message IDs but omit message HTML.
+- `listener.register`, `intersection.create` and `resize.create` include limited JavaScript origin stack frames, to locate the registration logic in captured JS; URL query strings/fragments are stripped from these callsite hints. Missing/minified symbols and wrapper-library stacks remain possible.
+
+The optional `--sweep` option waits until a `[data-scroll-root]` and turn wrappers appear (up to 120 seconds), then modifies the scroll element's actual scrollTop incrementally forward and backward, allowing browser intersection callbacks and React to execute organically. Synthetic scroll-event dispatch alone is not used. The ordinary manual capture mode remains active until operator signal/browser close. The tool does not inject a fake React renderer, nor does it guarantee snapshots for every turn.
+
+Usage from the PoC directory (choose a **fresh private directory**):
+
+```sh
+node render-probe.mjs \
+  'https://chatgpt.com/share/6ad1c0d5-49ec-83eb-a79b-85b04b938835' \
+  './render-probe-run-01' --sweep
+```
+
+Inspect `render-probe-run-01/summary.json`, `events.jsonl`, and `turns/*.html`. These are private data and should not be committed.
+
+The latest regression fixture additionally checks per-turn content mount/unmount transitions, stable IDs and registration callsites. This does not establish which callback causes each transition on ChatGPT's live page.
+
+Validation: `tests/.support/render-probe.mjs` runs the real entrypoint against a self-hosted virtualized HTML fixture in a real Chromium browser; its assertions check actual IO callback emissions, target scroll, snapshots, original message IDs at both ends and content persistence. GitHub Actions run `39432091366` (2026-10-20) reports PASS: https://github.com/massimilianonardi-ai/rumiai-dev-PoCs/actions/runs/39432091366 . The follow-up commit `2a8cacecbef5c9cda5753d23d78b45acda031e7e` avoids duplicate snapshots for nested wrappers sharing the same turn ID by selecting the outermost wrapper; the updated Chromium test also reports PASS in run `39432702338`: https://github.com/massimilianonardi-ai/rumiai-dev-PoCs/actions/runs/39432702338 . This is **synthetic-fixture browser validation**, not a real ChatGPT replay result. Full-page coverage and faithful DOM reconstruction remain open.
+
+## Real shared-page experiment and cumulative reconstruction (2026-10-20)
+
+The operator supplied a private `render-probe-run-01.zip` captured on the
+agreed real ChatGPT share using `--sweep`. The review found 5,247 events:
+331 native IntersectionObserver callbacks, 135 real scroll events, 82
+observed turn-content mounts, 78 unmounts, 148 snapshot events yielding 147
+distinct HTML files. The 42 snapshotted turn IDs cover the contiguous ordinal
+range **1–42**, with 42 distinct message IDs. A further wrapper was observed
+without any saved rendered message. `conversation-turn-0` was **not**
+captured; its absence is not automatically proof of a missing message.
+
+Native IntersectionObserver #13, with `[data-scroll-root]` and 1,000 px root
+margins, had matching same-turn visibility notifications preceding all observed
+mount/unmount transitions. This is compelling temporal correlation, not an
+instrumented proof of the internal React state update responsible for each
+transition. No independent RAW transcript was included in the ZIP; complete
+conversation coverage remains unverified.
+
+The separate `assemble-rendered-dom.mjs` utility now creates an inert
+cumulative `index.html`, `audit.json` and `resource-references.json`
+from render-probe evidence. It verifies individual hashes, orders by original
+DOM `conversation-turn-N` ordinal, preserves all captured snapshot-version
+provenance and selects the latest version per turn. The optional `--raw`
+argument compares message identities against a separately acquired
+`conversation.raw.json.gz`. The utility's synthetic reconstruction tests and
+real Chromium render-probe regression tests passed in
+[GitHub Actions run 39490178468](https://github.com/massimilianonardi-ai/rumiai-dev-PoCs/actions/runs/39490178468).
+The archived real run was independently inspected and a structural HTML
+preview assembled, but **the GitHub-published assembler has not itself been
+executed on the private ZIP in CI**.
+
+This is a structural artifact, not a browser-session replay. It does not
+include original loaded CSS/remote image bytes, internal React state or event
+listeners. Its strict Content Security Policy blocks external/network loads
+and scripts, with original asset reference URLs retained only in the private
+reference audit. Browser profiles or captured HTML containing private content
+must not be committed.
+
+## Data security and validation boundary
+
+This repository already contains user-committed browser profiles and raw response/script evidence, which may include cookies, session data or signed URLs. Never include raw profiles or new unreviewed captures in another commit. Removing tracked files in a forward commit does **not** erase the history; do not rewrite history without explicit authorization.
+
+The static findings above were verified against the exact Git blob sources and event indices. A user-operated controlled runtime experiment on the actual ChatGPT share is now available as a private ZIP and supports the observer/turn correlation described below. The full-fidelity, interactive DOM has **not** been recreated.
+
+## Cumulative offline DOM assembly (2026-10-20)
+
+The standalone experimental `assemble-rendered-dom.mjs` consumes an existing `render-probe.mjs` evidence directory. It does **not** navigate ChatGPT and does **not** replace the original renderer. It verifies each snapshot's SHA-256 against both filename and manifest, derives turn order from the captured `data-testid="conversation-turn-N"`, validates `data-turn-id-container` and `data-message-id`, selects the latest sequence-numbered HTML snapshot per turn, and concatenates exactly one original outer wrapper per turn into an **inert** cumulative document. Every previous snapshot version remains recorded in `audit.json`. It rejects duplicate ordinals, cross-turn duplicate message IDs, inconsistent identity, corrupt evidence and existing destination directories.
+
+Invocation from this PoC directory:
+
+```sh
+node assemble-rendered-dom.mjs ./render-probe-run-01 ./cumulative-dom-01
+# Optionally validate IDs against an independently exported source:
+node assemble-rendered-dom.mjs ./render-probe-run-01 ./cumulative-with-raw --raw /private/path/conversation.raw.json.gz
+```
+
+Files: `index.html` (original captured turn subtrees and minimal non-original presentation CSS), `audit.json` (selected hashes, all source versions, ordinal gaps and optional RAW-ID differences), `resource-references.json` (not-downloaded `src`/`href`/`poster`/`srcset` references). External network/script loading is blocked by a Content Security Policy; the HTML is **not** the running ChatGPT application and cannot preserve React state, callbacks, original CSS, asset bytes or interactivity. The assembly is private conversation data and should not be committed.
+
+The operator's uploaded `render-probe-run-01.zip` was locally audited and assembled without opening its Chromium profile. Physical evidence: 148 snapshot events / 147 distinct source HTML blobs map to **42 unique ordered turn IDs and 42 message IDs**, with the captured `conversation-turn-1` through `conversation-turn-42` range contiguous and no duplicate ordinals. The resulting cumulative page contains **42 top-level turn subtrees**; its resource-reference audit finds **13 `src`** and **27 `href`** references (not asset files). The original `conversation.raw.json.gz` was **not included**, so equivalence to the total source conversation is unverified; the additional non-message turn wrapper remains unrepresented, because no HTML snapshot was recorded for it. The private resulting ZIP was delivered to the user separately, not added to Git.
+
+Regression: `tests/.support/assemble-rendered-dom.mjs` verifies ordering, snapshot selection, version retention, RAW gap detection, a non-executable CSP, integrity failure and overwrite refusal. GitHub Actions `39490178468` passed both this synthetic-data test and the existing real-Chromium render-probe fixture: https://github.com/massimilianonardi-ai/rumiai-dev-PoCs/actions/runs/39490178468 . This is **not** a test of the user page with a browser, nor an original-CSS/resource fidelity guarantee.
+
+## Offline static-resource localization (2026-10-22)
+
+Experimental, source-bounded `localize-rendered-resources.mjs` is a **second stage** after `assemble-rendered-dom.mjs`. It consumes an existing inert cumulative DOM output and the existing `analysis-chromium-resources-02` data captured by `web-analyze`. No network requests are made, no original capture is changed and no Chromium profile is read.
+
+```sh
+node assemble-rendered-dom.mjs ./render-probe-run-01 ./cumulative-dom-01
+node localize-rendered-resources.mjs ./cumulative-dom-01 \
+  ./analysis-chromium-resources-02 ./cumulative-dom-localized-01
+```
+
+- Only first-party `chatgpt.com`, `*.oaistatic.com` and `*.openai.com` **saved** CSS, fonts and image/svg resource rows are eligible; JS, API JSON, HTML response bodies and foreign-host assets are not copied. Every allowed source body is independently checked against its SHA-256 and recorded length before output creation; SVG executable markup and invalid WOFF2 signatures are rejected. Content-addressed bytes are saved under `assets/`.
+- CSS files are attached in captured network order (deduplicated), with `url(...)` mapped to hash-named local assets when the matching resource was archived; remaining remote CSS URLs are disabled and `@import` directives are blocked. Captured image and SVG `<use href="...#symbol">` references in original turn HTML are localized when indexed matches exist. Link destinations inside conversation text are **not** rewritten.
+- Updated CSP continues to prevent scripts, connections, external media, forms and embedded frames, while allowing only local styles, images and fonts. The result includes `index.html`, original structural audit/reference metadata, `assets/` and `localization-audit.json` (counts and unresolved references). No React state, click handlers or dynamic widgets are restored.
+- In the user-committed resource index there are **47 first-party stylesheet response rows (45 distinct SHA-256 bodies)**, **7 first-party fonts labeled application/octet-stream (all named .woff2)**, plus first-party sprite/SVG resources. These are *source inventory*, not proof that all pass localization or that the final rendering matches the live page. Of the 13 `src` DOM references previously observed, most point to `www.google.com/s2/favicons`; the archive separately records **11 HTTP 301 redirects** that share exact session/request IDs with the corresponding saved `t*.gstatic.com` PNG responses. The localizer now permits only these **proven redirect aliases** for third-party images, resolving matching DOM favicon references without hostname/filename guessing. Unmatched original references are still reported, not silently substituted. No sensitive binaries are recopied into Git; use only the user's private local checkout for the output.
+- Regression in `tests/.support/localize-rendered-resources.mjs` validates CSS-relative images and WOFF2, SVG symbol fragments, **exact redirect-ID favicon alias mapping with HTML-encoded ampersands**, blocking external CSS imports, preserving inert CSP and ordinary content hyperlinks, rejecting corrupt SHA-256 and refusing to overwrite output. The final focused workflow run is linked in the current handoff; the earlier static-localizer checkpoint PASS was https://github.com/massimilianonardi-ai/rumiai-dev-PoCs/actions/runs/39847215881 . **This is a synthetic resource fixture test, not a real CSS screenshot parity validation.**
+- RAW message coverage still cannot be verified until `conversation.raw.json.gz` is made accessible; `assemble-rendered-dom.mjs --raw` already supports the comparison without an additional extraction.
+
+## Audited visible-message completeness from archived React Router RAW (2026-10-23)
+
+The previous "RAW not available" boundary has been resolved using evidence
+already collected by the operator. The **saved** `text/html` response for
+`https://chatgpt.com/share/6ad1c0d5-49ec-83eb-a79b-85b04b938835` is
+`analysis-chromium-resources-02/resources/125d7335b12ba7d8ac273ce92acf1aec7435936c3ed48e788d69690814977441.html`.
+It embeds a React Router `streamController.enqueue` serialized hydration
+stream. Its first frame is a flattened reference table (29,751 entries)
+containing the `linear_conversation` array (951 references). This is real
+RAW evidence, **not** a second download or a historical model-memory guess.
+
+The 951 references break down into 1 root with no message; 21 user;
+29 system; 429 assistant; and 471 tool nodes. Applying this observed
+capture's visibility criteria—user messages addressed to `all`, and
+assistant messages addressed to `all` with `end_turn=true`, excluding
+`metadata.is_visually_hidden_from_conversation=true`—yields exactly
+**21 user + 21 final assistant messages**. Four additional completed
+assistant finals explicitly marked visually hidden are excluded.
+
+An independent comparison with the operator-uploaded 42-turn cumulative DOM
+found **zero missing or extra original message IDs and identical order**.
+Both sides' newline-joined ordered IDs have SHA-256
+`6a9aba4e9294c8c5b0e17756b59a6f4cea03e30d40ef744393d20ea3186916b3`
+from the private capture. This establishes **complete visible-message ID and
+order coverage for the archived shared conversation**—not a guarantee about
+another share, hidden technical/tool nodes, visual-pixel identity, script
+execution or live React state. The operator separately accepted the
+localized page's visual fidelity.
+
+A standalone reproducible `audit-rendered-dom-raw.mjs` entrypoint reads the
+existing `cumulative-dom-01/audit.json` and the saved HTML `Document`
+indexed by `analysis-chromium-resources-02/resources.jsonl`, verifies its
+SHA-256 and length, parses the inert hydration data as text, and emits a
+privacy-limited JSON result (counts, SHA-256 fingerprints and mismatch status
+without raw transcript/ID disclosure):
+
+```sh
+node audit-rendered-dom-raw.mjs ./cumulative-dom-01 \
+  ./analysis-chromium-resources-02 --out ./raw-completeness-01.json
+```
+
+The synthetic test `tests/.support/audit-rendered-dom-raw.mjs` covers
+hidden completed finals, intermediate tool/assistant roles, exact ID/order
+matching, missing/extra IDs and tampered HTTP archives. New artifacts stay
+private and are not automatically committed.
+
+## Generated-image share diagnostic (2026-10-24)
+
+User physically acquired share `https://chatgpt.com/share/6ad13a5b-e9f0-83eb-8519-9e2d8c8097f3` into private `analysis-images-01` (2,170 CDP events), then executed `render-probe.mjs --sweep` into `render-probe-images-01` (236 probe events: 7 initial wrappers, 4 snapshot events / 4 unique snapshot content hashes, 13 sweep steps, 5 observed scrolls, one content-mounted event). `assemble-rendered-dom.mjs` returned 3 turns / 3 messages, with **2 missing intermediate ordinals** and just 2 source resource references. Repeating the assembler against the same output folder correctly refused to overwrite.
+
+The initial RAW audit identified 14 linear-conversation nodes: 3 system, 3 user, 4 assistant, 3 tool plus one root; it reported **3 expected user and 0 expected assistant**, with `missingFromDom=0` and status `complete-visible-message-identity-and-order`. **This is a diagnostic false positive**: the text-specific assistant finality filter (`recipient=all`, `end_turn=true`) cannot establish visibility of generated images when it excludes every assistant node, and the structural DOM has ordinal gaps. User evidence does not yet distinguish image-renderer wrappers without `data-message-id`, assistant finality metadata differences, deferred image rendering, or incomplete observer sweep. Do not claim any image assets were captured or localized on these logs alone; user has not yet run the image-share localizer or supplied image resource evidence.
+
+The RAW audit now explicitly reports missing turn ordinals and assistant-without-final counts, and returns `inconclusive-visible-message-coverage` (nonzero CLI status) when identifiers match only under an ambiguous filter or the DOM ordinal range has gaps. This preserves the previously validated 42-turn text-share criterion without declaring image-share completion. The regression adds both incomplete-ordinal and assistant-without-final cases. Tests validate the classification, not end-to-end image fidelity.
+
+Next: inspect private image-share `resources.jsonl` status/MIME distribution, observer logs for `turn.initial` wrappers with no message IDs, source hydration assistant content/recipient/finality metadata, and the DOM structure for image-bearing turns; selectively adjust observer/assembler and image-body localization based on concrete evidence. Avoid committing raw signed URLs, profiles or generated image contents. Original accepted text DOM and Markdown baseline remain unchanged.
+
+## Generated-image binary evidence and diagnostic helper (2026-10-24)
+
+The operator reran the corrected RAW audit for the second image-bearing share. It reported `inconclusive-visible-message-coverage`, 14 RAW nodes (3 user, 4 assistant, 3 system, 3 tool, one root), 3 captured user messages, **2 missing intermediate turn ordinals**, and one assistant addressed to `all` without `end_turn=true`. The warning is expected; the source does **not** prove that assistant image replies are absent from the underlying RAW.
+
+A local privacy-safe aggregate over the existing `analysis-images-01/resources.jsonl` reported **five saved PNG response rows totalling 6,762,034 bytes**, two image/SVG rows totalling 1,867 bytes, one WebP at 33,578 bytes, plus three `Other` SVG at 553,197 bytes and one `Other` ICO at 32,038 bytes. Seven initial turn wrappers were observed, but only two initially had descendants with `data-message-id`; five had none at that instant. These counts alone do **not** identify which PNGs are generated content or associate them with assistant replies, and do not establish a failure of network fetching.
+
+Added `inspect-image-capture.mjs` as an experimental **read-only** three-input analyzer (cumulative DOM, web-analyze archive, render-probe archive). It verifies image and turn HTML file integrity, reports saved image MIME/byte/dimension summaries and sanitized origin classes, and summarizes image elements and source kinds in captured turn snapshots. It imports the existing RAW-vs-DOM audit but does not leak the raw URL, original conversation text, original turn/message IDs, or image bytes. Usage:
+
+```sh
+node inspect-image-capture.mjs \
+  ./cumulative-images-01 ./analysis-images-01 ./render-probe-images-01
+```
+
+A synthetic Node 22 test covers image format/dimensions, missing initial turn-message IDs, source class counts, private-value non-disclosure and tampered evidence; GitHub Actions run `40075908722` **PASS** (including existing real Chromium fixture). **No operator execution on the second real share yet**. The diagnostic cannot infer image ownership from PNG size or resolve absent assistant DOM automatically. Further image-localizer modifications must follow evidence from this diagnostic, not speculation.
+
+
+## Repeated image-only DOM evidence and source URL correlation (2026-10-24)
+
+The operator executed the second, message-ID-independent probe against the
+generated-image share. It produced 293 events, including 57
+`turn.unidentified-snapshot` events from three distinct outer turn IDs.
+Six of those snapshot events contained `<img>` elements (18 cumulative tag
+occurrences), all classified as `other-host`. Three normal `turn.snapshot`
+events from three identified turns contained no images. These image-tag
+occurrences may be repeated states of the same image and do not prove 18
+independent assets. The archive still holds three 1536×1024 external-host
+PNG response bodies. The prior cumulative message-qualified DOM still
+omits two intermediate ordinal positions and its RAW finality assessment
+remains inconclusive.
+
+Extended `inspect-image-capture.mjs` in place to correlate literal image
+source attributes against exact archived image response URLs while
+verifying all referenced saved response bodies and snapshot hashes.
+The new `linkage` report separates identified from unidentified
+snapshots, deduplicates references and response bodies, reports ordinal-only
+counts and whether image-bearing ordinal positions are absent from the
+old cumulative DOM. No original URLs, message IDs, turn IDs, payloads or
+signed parameters are emitted. This does not infer redirects, create
+missing message IDs or assign RAW assistant authorship.
+
+Next: run the updated existing command once against the **existing**
+`analysis-images-01`, `cumulative-images-01` and
+`render-probe-images-02`. Compare `linkage.unidentified`,
+`linkage.identified` and `imageOrdinalsAbsentFromCumulative`
+before changing the actual offline assembler/localizer.
+
+## Generated-image URL mismatch classification (2026-10-24)
+
+Operator rerun of the exact-URL linkage report found one unique image source
+per unqualified conversation turn ordinal 2, 4, and 6; all three are absent
+from the previous message-qualified cumulative DOM. None of the three
+source URLs is identical to a saved image URL, despite three externally hosted
+1536×1024 PNG response bodies. This supports missing **image-bearing DOM
+capture** as one cause, but does not identify saved bytes or RAW assistant IDs.
+
+The read-only image diagnostic now separately classifies unmatched references
+by (1) exact original redirect URL sharing a CDP session/request ID with
+exactly one verified archived image body, or (2) non-binding host/path/query
+similarities and non-HTTP references. It does not turn similarities into
+automatic image mappings. Run only this diagnostic on already captured private
+data; inspect `linkage.unidentified.unmatchedEvidence` and each ordinal's
+counts before changing assembler/localizer or acquiring anything again.
+
+## Single-path provisional image candidates (2026-10-24)
+
+The latest operator-run `linkage.unidentified.unmatchedEvidence` shows
+**three** distinct unlinked image URLs, one each in turns 2/4/6; all three
+share an exact origin and URL path with one or more archived images but have
+different query strings. There are no recognized same-CDP-request redirects,
+and the original 1536×1024 archived PNGs cannot yet be mapped to turns
+without guessing.
+
+The inspector now reports `samePathCandidateEvidence`: per reference,
+how many distinct verified archived body hashes are available for its exact
+origin/path, distinguishing none, a single *provisional* body, and ambiguous
+multiple bodies. For one archived URL/body it also counts shared query keys
+with identical or different values and source/archive-only keys, **never the
+keys, their values or the original URL**. This supports a bounded decision
+about whether a candidate-only offline preview could be useful, without
+misstating asset identity. No automatic mapping or new capture.
+
+## First opt-in offline image-share preview (2026-10-24)
+
+Latest real physical inspect-image-capture result: each original image DOM
+turn (ordinal 2/4/6) has exactly **one** candidate archived PNG body at
+identical origin+path; there are three **distinct** candidate PNG hashes.
+For each pair six query keys have identical values and six have different
+values; none is unique to only one URL. No exact URL or same-CDP-request
+redirect match exists. This supports constructing an explicitly provisional
+preview, not claiming source image identity or assistant message completion.
+
+Added opt-in `assemble-rendered-dom.mjs --include-unidentified-images`.
+Only image-bearing unidentified snapshots can enter a preview; the latest
+image-bearing frame wins over later placeholders, original message-qualified
+frames remain preferred, ordinal and blob-integrity validation remain.
+The source audit labels unidentified image turns and provisional status.
+
+Added opt-in `localize-rendered-resources.mjs --provisional-image-path` only
+for outputs from that preview mode. It resolves unmatched **external**
+`<img src>` by exact origin+path to one unique verified archived PNG
+hash and one archived candidate URL. It refuses ambiguous paths, limits
+candidate count, checks PNG signatures, preserves inert CSP, emits the
+candidate-to-local-file manifest with source-URL SHA and `identityVerified:
+false` (not signed query parameters), and never contacts the web. A
+visual test on the real private capture is still required; original
+42-turn text visual acceptance and Markdown remain protected.
+
+## Failed physical HTML/CSS image preview, safer reading-view diagnostic (2026-10-24)
+
+Real vmdev operator result after assembly/localization:
+`turns=6`, `messages=3`, `missingOrdinals=0`,
+`stylesheets=17`, `staticFiles=25`, `mediaReferencesMatched=4`,
+`unresolved=73`, `ignored=457`, `provisionalImageCandidates=3`.
+Despite this structural success, the operator sees **only the first prompt**,
+large empty areas with replacement text where PNGs belong, and neither
+remaining user prompt. The static reconstruction is rejected for visual
+quality; counts did not prove readable DOM content or decoded images.
+Do not make a fidelity claim from successful resource localization alone.
+
+Added a separate no-network `render-readable-image-preview.mjs` against
+the already-localized output. It extracts identified-turn text using a
+detached parsed DOM, ignoring controls and display/virtualization rules,
+renders image-only turn ordinals as image cards, and embeds verified local
+PNG bodies via `data:` URI to avoid file-scheme/self-origin problems.
+The reading view deliberately **does not claim original styling**; it
+audits recovered text/PNG counts and missing turn ordinals without logging
+prompts, raw message IDs, signed URLs or bytes. A missing prompt is recorded
+as missing evidence, not silently filled from another source.
+
+Run this first on vmdev's existing private localized preview. If both
+remaining prompts appear, original CSS/runtime layout is implicated.
+If they remain absent, inspect selected snapshot text evidence without
+assuming source acquisition completeness. Original remote-query PNG
+identity and RAW assistant attribution are still unproven.
+
+## Internet-image comparison: CDP-request versus browser-selected URL (2026-10-24)
+
+User supplied a new public share with Internet-sourced images,
+`https://chatgpt.com/share/6ad1c0b3-f42c-83eb-bfbc-4e44c80863dc`.
+An assistant-side request to the share is blocked; the target remains
+uninspected here. Added an optional same-session `render-probe.mjs
+--compare-image-urls` image URL metadata observer and
+`inspect-image-capture.mjs --same-session <capture-dir>` sanitized diagnostic.
+One Chromium run records literal HTML `img src`, browser-resolved
+`img.currentSrc`, CDP request URLs, response URLs and redirect-origin
+request URL when observable; no response bodies are fetched. Comparison
+groups by real CDP session, distinguishes exact and same-path-query-only
+relationships, and never emits full URLs or original ID values.
+
+Testing includes isolated synthetic observations and real Chromium with
+an HTTP image and responsive `srcset` selection. These fixtures verify the
+mechanism, not how the operator's new ChatGPT share behaves. Data must
+remain in a user-local private directory outside Git; existing PoC history
+already contains profiles and sensitive-possible raw evidence that require
+independent privacy handling, not further duplication.
+
+## Same-session image response-body archive and inert transcript (2026-10-24)
+
+Extended the existing native-CDP `render-probe.mjs` with optional
+`--capture-image-bodies` (no default behavior change): on image response
+completion it requests the exact CDP response body and stores bounded
+SHA-256-addressed PNG/JPEG/WebP/GIF bytes with `sessionId/requestId`,
+MIME and status evidence under the private capture directory. The offline
+`render-same-session-offline.mjs` reuses cumulative turn ordering/verification,
+the accepted reading view text extractor and an exact request-body image
+resolver. It refuses same-path-only signed query matches and validates
+archived image bytes before generating a standalone network-disabled page.
+No CSS/React replay, RAW-assistant role inference or product change. This
+path needs real operator-side visual acceptance on generated and Internet
+image shares; fixture PASS is not evidence of actual remote completeness.
+
+## Operator batch failure and semantic offline reconstruction (2026-10-24)
+
+On vmdev the operator exercised three real public shares at
+`rumiai-dev-PoCs@27e6efd9f439e6eec5cb5cb0cd69681f715d618f`:
+(1) Internet images, 16 text turns, 6 image-bearing turns, 5 with verified
+bodies and 10 unresolved image references (partial); (2) 0 turn snapshots,
+`sweep.not-ready`, no HTML output; (3) 40 captured turns, 38 text-bearing
+turns, 5 verified distinct image bodies in 4 image-bearing turns, no missing
+ordinal among those observed. Operator visually **rejected** both rendered
+pages for lost bold/underline/rich formatting, giant standalone citation
+favicons with missing source links, and missing formulas, despite positive
+byte-integrity results. Earlier "same-session-offline" status proved only
+structural/image integrity, **not rich-message fidelity**.
+
+Root cause in `render-same-session-offline.mjs`: `messageText()` flattened
+all markup to text and separate global `img` traversal appended *all*
+images as full-size figures after each message. Refactor to a bounded
+semantic HTML/MathML renderer with safe source links, suppress favicon
+icons instead of generating standalone figures, preserve actual content
+image positions, and audit unsupported/absent math separately. Re-render
+**existing** private captures into new output directories; avoid redundant
+browser/network acquisitions. Share 2 remains a distinct pre-capture
+readiness/hydration failure; report DOM shape and fail explicitly on next
+real run rather than inventing DOM turns. Fixture test coverage is not
+physical acceptance until user visually checks new outputs.
+
+## Formula-availability investigation (2026-10-24)
+
+After physical rich re-rendering of the already private batch, operator:
+- Share 3: reading view visually very good; attachments absent but
+  optional and might duplicate a conversation transcript misleadingly.
+- Share 1: links now acceptable, but formulas are replaced with
+  `[Formula non ricostruibile dallo snapshot]`.
+- Sanitized share 1 audit: `turns=16`, `preservedMathFormulas=0`,
+  `mathSourceFallbacks=0`, `unavailableMathFormulas=198`,
+  `linkedSources=68`, `suppressedDecorativeImages=85`,
+  `embeddedImageOccurrences=0`, `imageBearingTurns=0`,
+  `status=same-session-offline-partial`. Share 3 audit:
+  `turns=40`, `preservedMathFormulas=0`,
+  `unavailableMathFormulas=0`, `linkedSources=16`,
+  `imageBearingTurns=3`, 3 verified distinct bodies, and
+  `status=same-session-offline`.
+  Absence of capture-attached source algebra is not proven by these audits.
+- Identified potential false positives in the renderer's
+  `/\\bkatex\\b/` expression: it also matches auxiliary CSS class
+  names `katex-mathml`, `katex-html`, `katex-display`, and
+  `katex-error`. Restrict actual math root recognition to the exact
+  `katex` CSS token; keep explicit `math` and `mjx-container`.
+- Added `inspect-math-capture.mjs` to classify *all existing local
+  snapshots* while reporting only counts and numeric ordinals (no private
+  formula text or URLs), including older versions that may have
+  MathML/TeX even when the selected newest does not. The user can run it
+  on the existing private share 1 capture without re-navigating ChatGPT.
+  The result determines whether to choose an existing MathML source,
+  typeset a retained TeX source using a real formatter, or add targeted
+  math source capture. Mathematical reconstruction remains **open**
+  until structural evidence and physical visual acceptance.
+
+## Visual-only KaTeX recovery after physical capture survey (2026-10-24)
+
+Real operator diagnostic `inspect-math-capture.mjs` on existing private
+Internet-image share 1:
+`inspectedTurns=16`, `katexRoots=198`,
+`mathmlInKatex=0`, `texAnnotations=0`, `texAttributes=0`,
+`ariaLabels=0`, `visualOnlyKatex=198`,
+`unrecoverableKatex=198` **in the sense of absent semantic source**,
+`mathElementsOutsideKatex=0`,
+`legacySubstringMathFalsePositives=0`; turns 2:63, 4:50, 6:4,
+12:15, 14:17, 16:49. Zero earlier snapshot had MathML or TeX.
+This specifically supports *reusing KaTeX's visual DOM* and **does not**
+justify fabricating source TeX/MathML. The 198 are genuine root elements,
+not merely auxiliary-class overcounts.
+
+PoC now sanitizes the visual-only KaTeX tree (bounded span class tokens,
+approved geometry styles, simple SVG paths, no URL-dependent content or
+HTML scripts), bundles pinned KaTeX 0.16.25 CSS and local WOFF2 font data
+into the standalone offline HTML, without client-side JS or network.
+Tests cover visual geometry survival and dangerous attribute removal,
+and a complete offline export embeds KaTeX fonts. Physical vmdev inspection
+of the *actual 198 formulas* is still required and is not claimed by a
+fixture PASS. Older reading views and all captures remain untouched.
+
+## Physical KaTeX replay failure: positioning and font size (2026-10-24)
+
+The operator physically tested `rumiai-dev-PoCs@2f0c18cd9c35704b20196d8831e1d5166f97d8ce`
+against the pre-existing private share-1 capture: `visualKatexFormulas=198`,
+`unavailableMathFormulas=0`, all 16 turns counted, links preserved.
+**Visually rejected**, despite a complete structural/math count:
+superscripts/subscripts misplaced; subscripts are normal-sized and
+baseline-aligned; complex formula following "allora OGY o delayed-feedback
+sono concettualmente più naturali. La relazione può essere vista così:"
+is wholly incorrect. Operator console GTK/Glean warnings are incidental
+and did not prevent opening the output.
+
+Actual root cause detected in `safeKatexStyle()`: KaTeX inline styles
+`font-size` and `position` were **not allowlisted**, breaking even
+semantically present visual HTML. Add strict per-property safe CSS
+validation rather than general CSS passthrough, preserve necessary
+span/SVG geometry, and use a real Chromium *computed layout comparison*
+of original generated KaTeX HTML against the exported projection (four
+synthetic representative formula families). Visual assessment of the
+named real formula remains necessary; no physical sample data uploaded.
+Attachments remain explicitly secondary.
+
+## Operator rejects positioned-style fix again; inspect actual private formulas (2026-10-24)
+
+The operator physically tested PoC `5ab6f4c3d7d2cdc9d923992c935b146798f3db23`
+against unchanged private share 1 and reports the displayed equations
+"come o peggio di prima"; audit still says exactly **198 visual KaTeX roots**,
+zero unavailable MathML/TeX, 16 turns, 68 source links. These results
+**invalidate** treating the earlier synthetic real-browser geometry test as
+sufficient evidence of actual-fidelity restoration. Do not ask the operator
+to run another speculative fixed renderer.
+
+Created `inspect-katex-difference.mjs` to compare each selected, SHA-verified
+actual captured KaTeX root with its corresponding existing offline output,
+by DOM tag order, class tokens, inline CSS property names/values (only
+counts and safe property keys returned), and SVG geometry attribute
+presence. It flags the operator-specified OGY context by a boolean, not
+a leaked text/formula. Next evaluate sanitized physical output; then
+fix only the evidence-grounded mismatch, and upgrade real-browser fixture
+to prevent the corresponding regression. If structure matches, investigate
+actual browser computed styles and font assets rather than guessing.
+
+## Cross-browser physical rejection; real capture-side Chromium geometry test (2026-10-24)
+
+The user opened the same rejected local HTML explicitly with Chromium,
+in addition to default `firefox_firefox.desktop`; **both show incorrect
+math**. VMware 3D/GPU, VA-API and GCM logs were observed, but no evidence
+links those warnings to the formula CSS. Previous test coverage only
+compared synthetic formulas using the pinned package CSS.
+
+Real private DOM comparison finds all 198 KaTeX roots and 4,919 descendant
+elements identical by tag/classes/order across original and export, and
+only 27 source `border-width` style omissions. Exact inline CSS property
+values otherwise match. A local Chromium diagnostic was added to compare
+**actual captured formula HTML and the failed export HTML** rendered
+side-by-side under the *same pinned offline stylesheet*, measuring
+computed font/position/border properties and per-descendant rectangles
+and returning sanitized aggregate counts. This is **not** live page
+style evidence and is not math visual acceptance. If the paired
+geometry is equal, future work must obtain source-page computed
+style/font evidence rather than guess at border-width as the sole cause.
+
+## Real font-related clue and original-page CSS measurement (2026-10-24)
+
+Operator physically ran the real snapshot versus failed offline view
+`inspect-katex-computed.mjs`: `examinedTurns=16`, 198 paired
+formulas, 5,117 nodes on each side (4,919 descendants + 198 roots),
+`nodeGeometryChanges=362`, largest delta **4 CSS px**, and all
+computed property mismatches confined to **borderTopWidth,
+borderBottomWidth, borderLeftWidth, borderRightWidth, 27 nodes each**.
+No measured font family, font size, vertical alignment, position,
+line height or transform difference with both DOMs under the **same
+offline CSS**. The user independently confirms the actual displayed
+font differs from ChatGPT, and subscripts are baseline-sized.
+
+Next measurement is *original live site CSS vs offline CSS*, not another
+sanitizer tweak. The new opt-in `render-probe.mjs --sweep
+--compare-live-katex <existing index.html>` samples rendered formula
+geometry and computed text/font/layout rules from the live page as its
+virtualized turns mount, then reads the already-generated standalone
+HTML in the same Chromium CDP session and compares per ordinal/formula
+and element index. Sanitized summary exposes only numerical coverage and
+style-property mismatch counts. Existing captures, 3-reading-rich
+approval, pinned production Markdown and older output remain intact;
+the private new Chromium profile and snapshots must never be committed.
+This still requires operator-side physical execution: fixtures are not
+evidence that live site CSS has been measured yet.
+
+## Opt-in live KaTeX probe appeared stuck and was interrupted (2026-10-24)
+
+User invoked the opt-in live-source style comparison on the public share
+with a fresh private `/home/admino/chatgpt-katex-live-TO4EZ08S`,
+`--sweep --headless --compare-live-katex` and prior private
+`1-reading-katex-layout/index.html`. Their terminal displayed only
+`DOM rendering observation active: ...` and eventually `^C CDP
+connection closed`, with no comparison JSON. **No physical live-CSS
+measurement was completed**; the duration or precise phase of interruption
+was not recorded. Code inspection shows the original implementation
+recomputed all mounted computed-style metrics every third sweep step, even
+for unchanged formulas, and emitted no phase/status updates. This is a
+plausible performance and observability defect, not proof of a precise
+stall mechanism.
+
+Correct the repeated-work pathology using page-local cached, font-settled
+per-turn samples; add explicit bounded CLI phase/step progress and
+SIGINT status 130 cleanup only in opt-in diagnostic mode, preserving the
+normal capture exporter and private-data contract. Test via real
+Chromium fixture with a matched source/export math root, progress assertion
+and an actual SIGINT while running. Do not infer any math CSS root cause
+from the user's aborted run. Physical source CSS comparison still pending.
+
+
+## Root cause proven: broken @font-face CSS embedding (2026-10-25)
+
+Operator's latest real live-vs-export comparison conclusively matched
+198 formula roots/5,117 child+root nodes, with **every node** reporting
+computed `fontFamily`, `fontSize`, `lineHeight` differences; most
+also had computed positioning/display changes. Source
+`document.fonts` knew 20 KaTeX faces, offline knew **0**. Therefore
+the earlier same-CSS original-vs-export test could not diagnose
+the missing original stylesheet: it imposed the **broken offline
+stylesheet on both**.
+
+Added an independent real-Chromium test against the precise standalone
+HTML output and its actual CSP. Baseline failed with a single parsed
+font-face and **zero `.katex` CSS rules**, and root font falling back
+to `system-ui` at 16px. Detailed code review isolated the
+`embed-katex-css.mjs` URL source regex `/src\s*:[^;]+/i`.
+Minified KaTeX `@font-face` `src` often terminates directly with
+`}`, not a semicolon. The greedy match consumed that brace, making
+the remainder of the stylesheet syntactically unparseable. The exact
+minimal fix changes regex to `/src\s*:[^;}]+/i`, preserving the
+closing brace and the following CSS rules.
+
+After this change, [exact-revision GitHub Actions 40217034013
+PASS](https://github.com/massimilianonardi-ai/rumiai-dev-PoCs/actions/runs/40217034013):
+real Chromium registered and loaded KaTeX WOFF2 fonts with the
+original standalone HTML CSP and applied KaTeX computed font. Prior
+tests also passed. These facts explain the user's normal-sized
+subscripts and collapsed complex formula, but **physical validation
+of the 198 user formulas is still pending**. Previous selected snapshot
+and 3-reading-rich accepted archive untouched. The remaining 27
+`border-width` attribute losses were not modified.
+
+## Physical mathematical rendering acceptance — 2026-10-25
+
+The operator ran the corrected PoC at `rumiai-dev-PoCs@58d31e1ffc2d4dbdd8bc0b7b96ccd2cffd3cc25d` on vmdev with the **existing** private `/home/admino/chatgpt-batch-vGRePjHh/1-capture` and created `1-reading-katex-css-fixed/index.html` (without new ChatGPT navigation or overwriting earlier views). Sanitized audit: 16 turns, **198 visual KaTeX formulas**, 0 unavailable formulas, 68 links, `same-session-offline` status. The operator explicitly **accepted the visual mathematical rendering**, including superscripts, subscripts, special symbols, and the complex relation following “La relazione può essere vista così:” in turn 2. This is user-observed visual fidelity for the captured share-1 mathematics, **not pixel-level equality, RAW conversation completeness or acceptance of all assets and conversations**. Earlier paragraphs that described this exact physical check as pending are historical checkpoints, now superseded by this confirmed result.
+
+No new renderer modification is required for this result. The 27 known `border-width` omissions, share-2 loading failure, missing/optional attachments and other artifact provenance remain separate; the user-accepted share-3 view, earlier private captures and reading files remain untouched.
+
+## Share 2 remains unacquired: existing private event classification (2026-10-26)
+
+After the operator physically accepted share-1 mathematical rendering,
+share 2 (`6ad1c0f5-7110-83eb-bc19-356d48fc1259`) is the next open
+export issue. Earlier vmdev evidence: 329 events, 9 image-response
+observations, 9 image-body attempts, `sweep.not-ready`, **zero captured
+turn snapshots** and no generated `2-reading/index.html`.
+The old capture may predate the current sanitized `pageShape` field.
+
+`inspect-share-readiness.mjs` now performs a local read-only audit of
+that existing capture, whitelisting only expected DOM-hook presence and
+numeric counts from `sweep.not-ready` and navigation outcomes. It does
+**not** claim that a missing `data-scroll-root` or a missing turn wrapper
+proves share expiration, authorization failure or a site redesign.
+Its fixture exercises actual JSONL files with private signed URL and
+conversation content in input and asserts no leak, plus both current and
+legacy page-shape cases. **Physical cause is pending the operator's
+sanitized audit**; no speculative change to the CDP observer, original
+formula renderer, or accepted private files is authorized by this
+finding alone.
+
+## Existing-capture audit confirms shape missing; scoped fresh readiness probe (2026-10-26)
+
+Operator ran `inspect-share-readiness.mjs` on existing private
+`/home/admino/chatgpt-batch-vGRePjHh/2-capture`.
+Actual JSON: `examinedEvents=329`, `navigation.result=1`,
+`sweep.not-ready=1`, `scroll.actual=6`,
+`network.image-response=9`, `network.image-body=9`,
+`finalNotReadyPageShape=null`, and
+`observedReadiness=readiness-failure-without-page-shape`.
+The command-level navigation observation had no error, but this old
+capture **cannot** discriminate a missing expected scroll root vs
+absent turn containers, and does not show link validity or page text.
+
+Added narrowly scoped opt-in mode to the current CDP observer:
+`--readiness-only --headless`, bounded by 30s, with normalized
+structural selector counts, page ready state, limited navigation
+response status when available and booleans for expected DOM hooks.
+It never performs the usual full scroll or attempts reconstruction.
+New Chrome fixtures assert real DOM readiness/hook presence and a
+loaded-but-hookless page; sanitized output strips private text and
+signed URLs. The resulting physical site observation is the next
+evidence boundary. Preserve approved math and rich output, and do not
+silently change DOM hooks or fabricate unavailable turn content.
