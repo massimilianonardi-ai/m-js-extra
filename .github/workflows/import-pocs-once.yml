@@ -54,7 +54,7 @@ jobs:
           test "$copied" -eq 246
           rm -f jsc.lib.js mk.lib.js .github/workflows/import-pocs-once.yml
           git add -A -- pocs/ jsc.lib.js mk.lib.js .github/workflows/import-pocs-once.yml
-          git diff --cached --check
+          # Preserve source bytes exactly, including pre-existing whitespace.
           test "$(git diff --cached --name-only --diff-filter=A | grep '^pocs/' | wc -l)" -eq 246
           test "$(git diff --cached --name-only --diff-filter=D | grep -E '^(jsc\.lib\.js|mk\.lib\.js|\.github/workflows/import-pocs-once\.yml)$' | wc -l)" -eq 3
           git -c user.name="RumiAI source migration" -c user.email="41898282+github-actions[bot]@users.noreply.github.com" \
