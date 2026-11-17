@@ -1,0 +1,63 @@
+name: One-time JavaScript PoC import
+on:
+  push:
+    branches: [main]
+    paths:
+      - .github/workflows/import-pocs-once.yml
+permissions:
+  contents: write
+jobs:
+  import:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Copy pinned PoC source, tests and documentation
+        shell: bash
+        env:
+          SOURCE_SHA: 08ae0a2aa8f404ca218f94e1ef5aea872666a6ef
+        run: |
+          set -euo pipefail
+          source_dir="$RUNNER_TEMP/rumiai-dev-PoCs"
+          git clone --quiet --filter=blob:none --no-checkout --single-branch --branch main \
+            https://github.com/massimilianonardi-ai/rumiai-dev-PoCs.git "$source_dir"
+          test "$(git -C "$source_dir" rev-parse HEAD)" = "$SOURCE_SHA"
+          dirs=(
+            pocs/063-large-text-engine/
+            pocs/066-text-edit-browser-gui/
+            pocs/068-chatgpt-shared-link-export/
+            pocs/069-web-page-analyze/
+            pocs/071-web-analyze/
+            pocs/072-web-analyze-stream-resource-content/
+            pocs/074-document2d-stack/
+          )
+          copied=0
+          while IFS= read -r -d '' entry; do
+            header="${entry%%$'\t'*}"
+            relative="${entry#*$'\t'}"
+            read -r mode kind sha <<< "$header"
+            case "$relative" in
+              pocs/068-chatgpt-shared-link-export/analysis-*|\
+              pocs/068-chatgpt-shared-link-export/archive/*|\
+              pocs/068-chatgpt-shared-link-export/node_modules/*)
+                continue ;;
+            esac
+            test "$kind" = blob
+            mkdir -p "$(dirname "$relative")"
+            git -C "$source_dir" show "$SOURCE_SHA:$relative" > "$relative"
+            if [[ "$mode" == 100755 ]]; then chmod 755 "$relative"; else chmod 644 "$relative"; fi
+            test "$(git hash-object "$relative")" = "$sha"
+            copied=$((copied + 1))
+          done < <(git -C "$source_dir" ls-tree -r -z "$SOURCE_SHA" -- "${dirs[@]}")
+          test "$copied" -eq 246
+          rm -f jsc.lib.js mk.lib.js .github/workflows/import-pocs-once.yml
+          git add -A -- pocs/ jsc.lib.js mk.lib.js .github/workflows/import-pocs-once.yml
+          git diff --cached --check
+          test "$(git diff --cached --name-only --diff-filter=A | grep '^pocs/' | wc -l)" -eq 246
+          test "$(git diff --cached --name-only --diff-filter=D | grep -E '^(jsc\.lib\.js|mk\.lib\.js|\.github/workflows/import-pocs-once\.yml)$' | wc -l)" -eq 3
+          git -c user.name="RumiAI source migration" -c user.email="41898282+github-actions[bot]@users.noreply.github.com" \
+            commit -m "Import seven JavaScript PoCs and remove extracted mk/jsc libraries"
+          git push origin HEAD:main
+          echo "COPIED=246 REMOVED_LIBRARIES=2"
